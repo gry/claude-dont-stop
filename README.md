@@ -37,8 +37,8 @@ is only the fallback (startup, and re-verification after waking).
 ## Install
 
 ```bash
-git clone https://github.com/gry/claude-dont-stop ~/tools/claude-dont-stop
-cd ~/tools/claude-dont-stop
+git clone https://github.com/gry/claude-dont-stop
+cd claude-dont-stop
 ./install.sh            # --dry-run to see the diff without writing anything
 ```
 
