@@ -113,8 +113,10 @@ However, in testing on 2.1.220 it was never observed refreshing an installed plu
 on its own — not even with a deliberately stale `lastUpdated`. Treat `claude plugin
 update` as the reliable path and `autoUpdate` as a best-effort extra.
 
-If you installed via `install.sh` from a clone, the update path is instead to pull
-the repo and re-run `./install.sh`, which reinstalls from your local copy.
+`claude plugin update` works for a directory-source install too — it reinstalls
+from the registered marketplace path, so a `git pull` plus a version bump in your
+clone is enough. Re-running `./install.sh` does the same and additionally refreshes
+the settings wiring, which is what you want if the statusLine setup changed.
 
 ### In a devcontainer
 
