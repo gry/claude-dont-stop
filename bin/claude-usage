@@ -139,14 +139,29 @@ load_endpoint() {
   return 1
 }
 
+# Dates are parsed with GNU `date -d`, NOT jq's fromdateiso8601. The endpoint
+# returns "2026-07-29T16:49:59.580242+00:00", and fromdateiso8601 only accepts a
+# literal "Z" suffix — given a numeric offset it errors out, which used to take
+# the whole normalisation down and left the gate with no data exactly when the
+# window hit 100%.
+iso_to_epoch() {
+  local s="$1"
+  [[ -n "$s" && "$s" != "null" ]] || { printf 'null'; return; }
+  local e; e=$(date -d "$s" +%s 2>/dev/null) || { printf 'null'; return; }
+  [[ "$e" =~ ^-?[0-9]+$ ]] && printf '%s' "$e" || printf 'null'
+}
+
 norm_from_endpoint() {
   load_endpoint || return 1
-  jq -e --argjson age "$RAW_AGE" --argjson stale "$RAW_STALE" '
-    def ep: (. // "") | if . == "" then null else (sub("\\.[0-9]+";"") | fromdateiso8601) end;
+  local fr wr
+  fr=$(iso_to_epoch "$(jq -r '.five_hour.resets_at // empty' <<<"$RAW" 2>/dev/null)")
+  wr=$(iso_to_epoch "$(jq -r '.seven_day.resets_at // empty' <<<"$RAW" 2>/dev/null)")
+  jq -e --argjson age "$RAW_AGE" --argjson stale "$RAW_STALE" \
+        --argjson fr "$fr" --argjson wr "$wr" '
     { five_pct:  (.five_hour.utilization // 0),
-      five_reset: (.five_hour.resets_at | ep),
+      five_reset: $fr,
       week_pct:  (.seven_day.utilization // 0),
-      week_reset: (.seven_day.resets_at | ep),
+      week_reset: $wr,
       extra_enabled: (.extra_usage.is_enabled // false),
       extra_pct: (.extra_usage.utilization // null),
       source: "endpoint", age: $age, stale: ($stale == 1) }' <<<"$RAW" 2>/dev/null

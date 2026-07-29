@@ -60,6 +60,43 @@ OUT=$("$BIN/claude-usage" --gate 95 --cache-only); RC=$?
 check "weekly wins over 5h when both apply" "$RC" 1
 
 echo
+echo "== endpoint path (no statusline cache) =="
+# Regression: the endpoint returns "...+00:00" offsets, which jq's
+# fromdateiso8601 cannot parse (it only accepts a literal "Z"). That used to sink
+# the whole normalisation and leave the gate blind exactly at 100%.
+rm -f "$DS/rate_limits.json"
+FIVE_ISO=$(date -u -d "@$(( $(date +%s) + 3600 ))" '+%Y-%m-%dT%H:%M:%S.580242+00:00')
+WEEK_ISO=$(date -u -d "@$(( $(date +%s) + 400000 ))" '+%Y-%m-%dT%H:%M:%S.580264+00:00')
+jq -nc --arg f "$FIVE_ISO" --arg w "$WEEK_ISO" \
+  '{five_hour:{utilization:100.0, resets_at:$f},
+    seven_day:{utilization:51.0, resets_at:$w},
+    extra_usage:{is_enabled:false, utilization:100.0, disabled_reason:"org_level_disabled_until"}}' \
+  > "$DS/usage.json"
+
+OUT=$("$BIN/claude-usage" --line --cache-only 2>&1); RC=$?
+check "--line works off the endpoint response" "$RC" 0
+has   "  parsing the +00:00 offset" "$OUT" "5h 100%"
+
+OUT=$("$BIN/claude-usage" --norm --cache-only 2>&1)
+jq -e '.five_reset | type == "number"' <<<"$OUT" >/dev/null 2>&1 \
+  && ok "  and five_reset is a real epoch, not null" || bad "  five_reset did not parse" "$OUT"
+jq -e '.extra_enabled == false' <<<"$OUT" >/dev/null 2>&1 \
+  && ok "  and extra_usage is carried through" || bad "  extra_usage missing" "$OUT"
+
+OUT=$("$BIN/claude-usage" --gate 95 --cache-only); RC=$?
+check "  gate blocks at 100% via the endpoint" "$RC" 1
+has   "  with a usable deadline" "$OUT" "deadline="
+DL=$(sed -n 's/.*deadline=\([0-9]*\).*/\1/p' <<<"$OUT")
+[[ -n "$DL" ]] && ok "  deadline is numeric ($DL)" || bad "  no numeric deadline" "$OUT"
+
+# The hook must actually act on it rather than silently no-op.
+cfg '{enabled:true, threshold:95, maxSleepSecs:60}'
+OUT=$(run_gate_hook '{"hook_event_name":"Stop","stop_hook_active":false}'); RC=$?
+check "  and the hook reacts instead of no-op'ing" "$RC" 0
+has   "  (capped by maxSleepSecs, with a reason)" "$OUT" "maxSleepSecs"
+rm -f "$DS/usage.json"
+
+echo
 echo "== dont-stop-gate hook: when it must do NOTHING =="
 seed 99 5400 40 400000         # a blocking situation for all of these
 
