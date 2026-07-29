@@ -1,7 +1,7 @@
 {
   "name": "dont-stop",
   "description": "Pauses the session when the 5-hour usage window runs out and resumes it automatically once it resets. Stops and warns you if the weekly cap is what ran out.",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "author": {
     "name": "gry",
     "url": "https://github.com/gry"

@@ -83,6 +83,39 @@ That is why **`install.sh` is the recommended route**: it points at the cloned
 repo, whose path does not change across updates, and it preserves any statusLine
 you already had.
 
+## Updating
+
+```bash
+claude plugin update dont-stop@claude-dont-stop   # then restart Claude Code
+```
+
+That single command is enough: it checks the source directly and pulls the newest
+published version, even when the locally cached marketplace copy is behind. You do
+**not** need `claude plugin marketplace update` first.
+
+Updates are keyed on the `version` field in `.claude-plugin/plugin.json`, so only a
+version bump produces a new install; commits that do not bump it are not picked up.
+Old versions stay in `~/.claude/plugins/cache/` alongside the new one.
+
+Marketplace entries accept an `autoUpdate` flag in `settings.json`:
+
+```jsonc
+"extraKnownMarketplaces": {
+  "claude-dont-stop": {
+    "source": { "source": "github", "repo": "gry/claude-dont-stop" },
+    "autoUpdate": true
+  }
+}
+```
+
+It is a real setting and is synced into `known_marketplaces.json` at session start.
+However, in testing on 2.1.220 it was never observed refreshing an installed plugin
+on its own — not even with a deliberately stale `lastUpdated`. Treat `claude plugin
+update` as the reliable path and `autoUpdate` as a best-effort extra.
+
+If you installed via `install.sh` from a clone, the update path is instead to pull
+the repo and re-run `./install.sh`, which reinstalls from your local copy.
+
 ### In a devcontainer
 
 ```jsonc
