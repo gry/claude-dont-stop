@@ -54,10 +54,32 @@ case "${CLAUDE_DONT_STOP:-}" in
 esac
 [[ "$ENABLED" == "true" ]] || exit 0
 
-# ---- 2. loop guard ------------------------------------------------------------
-# Claude Code sets stop_hook_active once we have already blocked this turn from
-# ending. Waiting again here would loop and hit the consecutive-block cap.
+# ---- 2. loop guards -----------------------------------------------------------
+# (a) Claude Code sets stop_hook_active once we have already blocked this turn
+# from ending. Waiting again here would loop and hit the consecutive-block cap.
 [[ "$(jq_in '.stop_hook_active')" == "true" ]] && { log "stop_hook_active -> no-op"; exit 0; }
+
+# (b) Our own guard, because stop_hook_active is NOT provided on SubagentStop:
+# without this, one exit-2 per subagent completion can resurrect it forever. Cap
+# how often this session may be woken; the counter decays on its own.
+WAKE_CAP=$(cfg maxWakesPerWindow 3)
+WAKE_WINDOW=$(cfg wakeWindowSecs 600)
+SESSION=$(jq_in '.session_id // "nosession"')
+WAKE_F="$DS_DIR/wakes-${SESSION//[^A-Za-z0-9_-]/_}"
+prune_wakes() {
+  local cutoff=$(( $(date +%s) - WAKE_WINDOW )) kept=""
+  [[ -s "$WAKE_F" ]] && while read -r t; do
+    [[ "$t" =~ ^[0-9]+$ ]] && (( t > cutoff )) && kept+="$t"$'\n'
+  done < "$WAKE_F"
+  printf '%s' "$kept" > "$WAKE_F"
+  printf '%s' "$kept" | grep -c . 2>/dev/null || echo 0
+}
+RECENT=$(prune_wakes)
+if (( RECENT >= WAKE_CAP )); then
+  log "already woke this session ${RECENT}x in ${WAKE_WINDOW}s -> no-op (loop guard)"
+  exit 0
+fi
+record_wake() { date +%s >> "$WAKE_F"; }
 
 # ---- 3. StopFailure: only rate limits concern us ------------------------------
 API_ERR=$(jq_in '.error // empty')
@@ -112,11 +134,15 @@ esac
 NOW=$(date +%s)
 if (( DEADLINE <= NOW )); then
   # The reset already happened (stale data, or the clock caught up while we were
-  # deciding). Nothing to wait for: the grace margin only applies to future
-  # resets, adding it to a past instant would mean sleeping for nothing.
-  log "the reset had already passed, not sleeping"
-  echo "dont-stop: the usage window has already reset. Carry on with the work where you left off." >&2
-  exit 2
+  # deciding). Nothing to wait for, so there is nothing to resume from either:
+  # exit 0 and let the turn end normally.
+  #
+  # This MUST NOT exit 2. Waking the model when no wait occurred is an infinite
+  # loop: the model wakes, finishes, the hook fires again, sees the same past
+  # deadline, wakes it again. SubagentStop makes it worse — it does not carry
+  # stop_hook_active, so Claude Code's own loop guard never trips there.
+  log "the reset had already passed, nothing to wait for -> no-op"
+  exit 0
 fi
 
 TARGET=$(( DEADLINE + GRACE ))
@@ -168,6 +194,7 @@ if (( POST_RC == 1 || POST_RC == 4 )); then
 fi
 rm -f "$DEADLINE_F" 2>/dev/null
 
+record_wake
 cat >&2 <<EOF
 dont-stop: the work was paused because $REASON. I waited $HR, until $HH, and the
 usage window has now reset ($POST).

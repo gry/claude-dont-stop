@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# dont-stop-announce — tells you, in the console, that the session is about to
+# wait and that it will resume by itself.
+#
+# Why this is a separate hook: dont-stop-gate runs with asyncRewake, in the
+# background, and a hook's output only surfaces once it finishes — which for the
+# gate is *after* the wait is over. So the gate physically cannot announce the
+# pause as it begins. This hook is registered on the same events but WITHOUT
+# asyncRewake, so it runs first, prints, and exits immediately.
+#
+# It only ever prints; it never blocks and never waits. Cheap by design: reads
+# the cache, never the network.
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+USAGE_BIN="${CLAUDE_DONT_STOP_USAGE_BIN:-$HERE/claude-usage}"
+CFG="${CLAUDE_DONT_STOP_CONFIG:-$HOME/.claude/dont-stop.json}"
+
+IN=$(cat)
+jq_in() { jq -r "$1" <<<"$IN" 2>/dev/null; }
+EVENT=$(jq_in '.hook_event_name // "?"')
+
+cfg() {
+  local v=""
+  [[ -r "$CFG" ]] && command -v jq >/dev/null 2>&1 && \
+    v=$(jq -r --arg k "$1" 'if has($k) and .[$k] != null then .[$k] else empty end' "$CFG" 2>/dev/null)
+  [[ -n "$v" ]] && printf '%s' "$v" || printf '%s' "$2"
+}
+say() { jq -nc --arg m "$1" '{systemMessage:$m}'; exit 0; }
+
+ENABLED=$(cfg enabled true)
+case "${CLAUDE_DONT_STOP:-}" in 0|false|off|no) ENABLED=false ;; 1|true|on|yes) ENABLED=true ;; esac
+[[ "$ENABLED" == "true" ]] || exit 0
+
+# Same guards as the gate, so we never announce a pause that will not happen.
+[[ "$(jq_in '.stop_hook_active')" == "true" ]] && exit 0
+if [[ "$EVENT" == "StopFailure" ]]; then
+  [[ "$(jq_in '.error // empty')" == "rate_limit" ]] || exit 0
+fi
+
+THRESHOLD=$(cfg threshold 95)
+[[ -n "${CLAUDE_DONT_STOP_THRESHOLD:-}" ]] && THRESHOLD="$CLAUDE_DONT_STOP_THRESHOLD"
+MAX_SLEEP=$(cfg maxSleepSecs 21600)
+
+export CLAUDE_DONT_STOP_WEEKLY_MAX_WAIT="$(cfg weeklyMaxWaitSecs 28800)"
+OUT=$("$USAGE_BIN" --gate "$THRESHOLD" --cache-only 2>/dev/null); RC=$?
+
+fmt() { local w=$1
+  if   (( w < 60 ));   then printf '%ss' "$w"
+  elif (( w < 3600 )); then printf '%dm' $(( w/60 ))
+  else printf '%dh%02dm' $(( w/3600 )) $(( w%3600/60 )); fi; }
+
+case "$RC" in
+  1|4)
+    DL=$(sed -n 's/.*deadline=\([0-9]*\).*/\1/p' <<<"$OUT")
+    [[ "$DL" =~ ^[0-9]+$ ]] || exit 0
+    # Use the same grace the gate will use, so the announced time matches the
+    # actual wake-up rather than being a minute out.
+    GRACE=$(cfg graceSecs 60)
+    TARGET=$(( DL + GRACE ))
+    WAIT=$(( TARGET - $(date +%s) ))
+    (( WAIT <= 0 )) && exit 0               # nothing to wait for; the gate will no-op
+    (( WAIT > MAX_SLEEP )) && exit 0        # the gate will refuse; do not promise a wait
+    WHY=$([[ "$RC" == 4 ]] && echo "weekly cap exhausted" || echo "5h window at $(sed -n 's/.*5h=\([0-9]*\)%.*/\1/p' <<<"$OUT")%")
+    say "⏸  dont-stop: $WHY. Pausing until $(date -d "@$TARGET" '+%H:%M %Z') (~$(fmt "$WAIT")) and resuming on its own — you can leave this running and walk away. Nothing else to do."
+    ;;
+  3)
+    say "⛔ dont-stop: WEEKLY cap exhausted and its reset is too far off to wait for. Stopping here rather than sleeping for days. ($OUT)"
+    ;;
+esac
+exit 0

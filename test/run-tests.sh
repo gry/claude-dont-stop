@@ -123,14 +123,25 @@ check "  and no noise on stdout" "$OUT" ""
 echo
 echo "== dont-stop-gate hook: when it MUST act =="
 
-# Deadline already past: must exit 2 immediately, without sleeping.
+# Deadline already past: no wait happened, so there is nothing to resume from.
+# It MUST exit 0, not 2 — waking the model when we never slept is an infinite
+# loop, and SubagentStop carries no stop_hook_active to break it.
 seed 99 -10 40 400000
 START=$(date +%s)
 OUT=$(run_gate_hook '{"hook_event_name":"Stop","stop_hook_active":false}' 2>"$TMP/err"); RC=$?
 ELAPSED=$(( $(date +%s) - START ))
-check "5h exhausted with the reset already past -> exit 2 (wakes the model)" "$RC" 2
+check "5h exhausted but reset already past -> exit 0 (no bogus wake)" "$RC" 0
 [[ $ELAPSED -lt 5 ]] && ok "  and does not sleep (${ELAPSED}s)" || bad "  should not sleep" "took ${ELAPSED}s"
-has   "  with an instruction to carry on" "$(cat "$TMP/err")" "Carry on"
+
+# The regression that started it: repeated SubagentStop must converge, not loop.
+rm -f "$DS"/wakes-* "$DS/deadline"
+LOOPS=0
+for i in 1 2 3 4 5 6; do
+  R=$(printf '{"hook_event_name":"SubagentStop","agent_type":"x","session_id":"loopy","stop_hook_active":false}' \
+      | "$BIN/dont-stop-gate" >/dev/null 2>&1; echo $?)
+  [[ "$R" == "2" ]] && LOOPS=$((LOOPS+1))
+done
+check "6 consecutive SubagentStops never resurrect the subagent" "$LOOPS" 0
 
 # Weekly exhausted and far off: systemMessage and NO sleeping.
 seed 50 5400 100 400000
@@ -162,6 +173,20 @@ check "wait > maxSleepSecs -> exit 0 without sleeping" "$RC" 0
 has   "  explaining why" "$OUT" "maxSleepSecs"
 
 echo
+echo "== wake cap (SubagentStop has no stop_hook_active of its own) =="
+rm -f "$DS"/wakes-* "$DS/deadline"
+cfg '{enabled:true, threshold:95, graceSecs:1, maxWakesPerWindow:2, wakeWindowSecs:600}'
+WOKE=0
+for i in 1 2 3 4 5; do
+  seed 99 1 40 400000
+  R=$(printf '{"hook_event_name":"SubagentStop","agent_type":"x","session_id":"capped","stop_hook_active":false}' \
+      | "$BIN/dont-stop-gate" >/dev/null 2>&1; echo $?)
+  [[ "$R" == "2" ]] && WOKE=$((WOKE+1))
+  rm -f "$DS/deadline"
+done
+check "wakes are capped at maxWakesPerWindow across repeated fires" "$WOKE" 2
+
+echo
 echo "== shared deadline (subagents must not chain their waits) =="
 rm -f "$DS/deadline"
 seed 99 3 40 400000
@@ -177,6 +202,38 @@ wait $P1 $P2 $P3
 E=$(( $(date +%s) - S ))
 [[ $E -lt 30 ]] && ok "3 concurrent waits finish together (${E}s, not 3x)" \
                 || bad "the waits chained" "${E}s"
+
+echo
+echo "== dont-stop-announce: tells you before the wait, not after =="
+cfg '{enabled:true, threshold:95, graceSecs:60, maxSleepSecs:21600}'
+seed 40 5400 20 400000
+OUT=$(printf '{"hook_event_name":"Stop","stop_hook_active":false}' | "$BIN/dont-stop-announce")
+check "silent below the threshold" "$OUT" ""
+
+seed 100 7860 51 400000
+OUT=$(printf '{"hook_event_name":"Stop","stop_hook_active":false}' | "$BIN/dont-stop-announce")
+jq -e '.systemMessage' <<<"$OUT" >/dev/null 2>&1 \
+  && ok "announces the pause via systemMessage" || bad "no systemMessage" "$OUT"
+M=$(jq -r '.systemMessage' <<<"$OUT" 2>/dev/null)
+has "  says it resumes on its own" "$M" "resuming on its own"
+has "  and gives the wake-up time" "$M" "Pausing until"
+
+seed 50 5400 100 400000
+M=$(printf '{"hook_event_name":"Stop","stop_hook_active":false}' | "$BIN/dont-stop-announce" | jq -r '.systemMessage')
+has "weekly exhausted -> says it is stopping, not waiting" "$M" "Stopping here"
+
+seed 100 7860 51 400000
+OUT=$(printf '{"hook_event_name":"Stop","stop_hook_active":true}' | "$BIN/dont-stop-announce")
+check "silent when stop_hook_active (no double announce)" "$OUT" ""
+OUT=$(printf '{"hook_event_name":"StopFailure","error":"overloaded","stop_hook_active":false}' | "$BIN/dont-stop-announce")
+check "silent for non rate_limit StopFailure" "$OUT" ""
+OUT=$(CLAUDE_DONT_STOP=0 printf '{"hook_event_name":"Stop","stop_hook_active":false}' | CLAUDE_DONT_STOP=0 "$BIN/dont-stop-announce")
+check "silent when disabled" "$OUT" ""
+
+# Must not promise a wait the gate will refuse to make.
+cfg '{enabled:true, threshold:95, maxSleepSecs:60}'
+OUT=$(printf '{"hook_event_name":"Stop","stop_hook_active":false}' | "$BIN/dont-stop-announce")
+check "silent when the wait exceeds maxSleepSecs (gate would refuse)" "$OUT" ""
 
 echo
 echo "== dont-stop-context: output shape =="
