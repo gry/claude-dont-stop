@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# dont-stop-ctl — inspect and adjust dont-stop. Writes ~/.claude/dont-stop.json.
+# The hooks re-read the config on every fire, so changes apply immediately.
+
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+USAGE_BIN="${CLAUDE_DONT_STOP_USAGE_BIN:-$HERE/claude-usage}"
+CFG="${CLAUDE_DONT_STOP_CONFIG:-$HOME/.claude/dont-stop.json}"
+DS_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/claude-dont-stop"
+LOG="$DS_DIR/dont-stop.log"
+
+command -v jq >/dev/null || { echo "jq is required" >&2; exit 2; }
+[[ -f "$CFG" ]] || echo '{}' > "$CFG"
+
+set_key() { # set_key <key> <json-value>
+  local tmp; tmp=$(mktemp)
+  jq --arg k "$1" --argjson v "$2" '.[$k] = $v' "$CFG" > "$tmp" && mv "$tmp" "$CFG"
+}
+# See the note in dont-stop-gate: '.[$k] // $d' swallows false values.
+get() { jq -r --arg k "$1" --arg d "$2" \
+        'if has($k) and .[$k] != null then .[$k] else $d end | tostring' "$CFG"; }
+
+status() {
+  local en th wk ms line rc gate
+  en=$(get enabled true); th=$(get threshold 95)
+  wk=$(get weeklyMaxWaitSecs 28800); ms=$(get maxSleepSecs 21600)
+  line=$("$USAGE_BIN" --line 2>&1)
+  gate=$("$USAGE_BIN" --gate "$th" 2>&1); rc=$?
+  printf 'dont-stop: %s · 5h threshold %s%%\n' \
+    "$([[ $en == true ]] && echo ON || echo OFF)" "$th"
+  printf 'usage:     %s\n' "$line"
+  printf 'gate:      %s (exit %s)\n' "$gate" "$rc"
+  printf 'waits:     max %sh on the 5h window · max %sh waiting for the weekly reset\n' \
+    "$(( ms / 3600 ))" "$(( wk / 3600 ))"
+  printf 'config:    %s\n' "$CFG"
+  [[ -n "${CLAUDE_DONT_STOP:-}" ]] && \
+    printf 'NOTE:      CLAUDE_DONT_STOP=%s in the environment overrides the config\n' "$CLAUDE_DONT_STOP"
+  case "$rc" in
+    0) echo 'verdict:   good to keep going.' ;;
+    1) echo 'verdict:   5h window exhausted; the hook would wait for the reset.' ;;
+    3) echo 'verdict:   WEEKLY cap exhausted and far off; the hook would stop and tell you.' ;;
+    4) echo 'verdict:   weekly cap exhausted but the reset is near; the hook would wait.' ;;
+    *) echo 'verdict:   could not determine (see the error above).' ;;
+  esac
+}
+
+case "${1:-status}" in
+  status|"")  status ;;
+  on)         set_key enabled true;  echo "dont-stop ON (threshold $(get threshold 95)%)" ;;
+  off)        set_key enabled false; echo "dont-stop OFF — no automatic waiting" ;;
+  threshold)  [[ "${2:-}" =~ ^[0-9]+$ ]] && (( $2 >= 1 && $2 <= 100 )) \
+                || { echo "usage: dont-stop-ctl threshold <1-100>" >&2; exit 2; }
+              set_key threshold "$2"; echo "5h window threshold: $2%" ;;
+  [0-9]*)     exec "$0" threshold "$1" ;;
+  log)        [[ -s "$LOG" ]] && tail -n "${2:-40}" "$LOG" || echo "(no waits recorded)" ;;
+  config)     jq . "$CFG" ;;
+  *) cat >&2 <<EOF
+usage: dont-stop-ctl [status|on|off|threshold <N>|<N>|log [n]|config]
+EOF
+     exit 2 ;;
+esac

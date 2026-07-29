@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# dont-stop-context — injects the usage-window state into the model's context.
+#
+# Installed on SessionStart and UserPromptSubmit, returning
+# hookSpecificOutput.additionalContext, which is the supported way to push text
+# into the model's context (a bare top-level additionalContext is NOT accepted:
+# Claude Code requires it nested under hookSpecificOutput with its hookEventName).
+#
+# Cheap by design: on UserPromptSubmit it reads only the cache written by the
+# statusline, never touching the network. On SessionStart it may query the
+# endpoint, because no API responses have filled that cache yet.
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+USAGE_BIN="${CLAUDE_DONT_STOP_USAGE_BIN:-$HERE/claude-usage}"
+CFG="${CLAUDE_DONT_STOP_CONFIG:-$HOME/.claude/dont-stop.json}"
+
+IN=$(cat)
+EVENT=$(jq -r '.hook_event_name // "?"' <<<"$IN" 2>/dev/null)
+
+cfg() {
+  # See the note in dont-stop-gate: '.[$k] // empty' swallows false values.
+  local v=""
+  [[ -r "$CFG" ]] && command -v jq >/dev/null 2>&1 && \
+    v=$(jq -r --arg k "$1" 'if has($k) and .[$k] != null then .[$k] else empty end' "$CFG" 2>/dev/null)
+  [[ -n "$v" ]] && printf '%s' "$v" || printf '%s' "$2"
+}
+
+emit() { jq -nc --arg e "$EVENT" --arg c "$1" \
+  '{hookSpecificOutput:{hookEventName:$e, additionalContext:$c}}'; }
+
+ENABLED=$(cfg enabled true)
+case "${CLAUDE_DONT_STOP:-}" in 0|false|off|no) ENABLED=false ;; 1|true|on|yes) ENABLED=true ;; esac
+[[ "$ENABLED" == "true" ]] || exit 0
+
+THRESHOLD=$(cfg threshold 95)
+[[ -n "${CLAUDE_DONT_STOP_THRESHOLD:-}" ]] && THRESHOLD="$CLAUDE_DONT_STOP_THRESHOLD"
+
+if [[ "$EVENT" == "SessionStart" ]]; then
+  LINE=$("$USAGE_BIN" --line 2>/dev/null) || exit 0
+  [[ -n "$LINE" ]] || exit 0
+  emit "Claude account usage: ${LINE}.
+dont-stop is active (threshold ${THRESHOLD}% of the 5h window). When the window runs
+out, a hook will pause the session and wake it up again once it resets: you do not
+need to watch usage yourself or launch any sleep. If the WEEKLY cap runs out and its
+reset is far away, the session will stop and the user will be told."
+  exit 0
+fi
+
+# UserPromptSubmit: cache only, no network, and only if we have recent data.
+[[ "$(cfg injectOnPrompt true)" == "true" ]] || exit 0
+LINE=$("$USAGE_BIN" --line --cache-only 2>/dev/null) || exit 0
+[[ -n "$LINE" ]] || exit 0
+emit "Claude account usage right now: ${LINE}"

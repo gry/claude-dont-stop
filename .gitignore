@@ -1,0 +1,13 @@
+# local caches and logs (should never live in the repo)
+*.log
+*.jsonl
+rate_limits.json
+usage.json
+deadline
+
+# settings backups written by install.sh
+*.bak.*
+
+# scratch
+test/tmp/
+.DS_Store

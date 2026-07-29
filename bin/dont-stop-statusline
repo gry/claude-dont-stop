@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# dont-stop-statusline — statusLine wrapper that caches usage and delegates.
+#
+# Claude Code hands the statusLine command a JSON blob that includes:
+#   .rate_limits.five_hour.{used_percentage,resets_at}
+#   .rate_limits.seven_day.{used_percentage,resets_at}   (resets_at = epoch seconds)
+# ("Only present for subscribers after first API response")
+#
+# That block is the FREE usage source: it arrives with every API response, costs
+# no network call and has no rate limit. This wrapper dumps it to disk and then
+# passes the full JSON on to whatever statusline you already had
+# (statuslineDelegate), so nothing is clobbered.
+#
+# With no delegate configured, it prints a usage line of its own.
+
+set -uo pipefail
+
+CFG="${CLAUDE_DONT_STOP_CONFIG:-$HOME/.claude/dont-stop.json}"
+DS_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/claude-dont-stop"
+SL_CACHE="$DS_DIR/rate_limits.json"
+
+IN=$(cat)
+
+# --- 1. cache rate_limits (the point of this; must never break the statusline) --
+if command -v jq >/dev/null 2>&1; then
+  mkdir -p "$DS_DIR" 2>/dev/null
+  printf '%s' "$IN" | jq -c '
+      .rate_limits as $r
+      | select($r != null and $r.five_hour != null)
+      | { five_pct:   $r.five_hour.used_percentage,
+          five_reset: $r.five_hour.resets_at,
+          week_pct:   $r.seven_day.used_percentage,
+          week_reset: $r.seven_day.resets_at,
+          written_by: "statusline" }' > "$SL_CACHE.tmp" 2>/dev/null \
+    && [[ -s "$SL_CACHE.tmp" ]] && mv "$SL_CACHE.tmp" "$SL_CACHE" 2>/dev/null
+  rm -f "$SL_CACHE.tmp" 2>/dev/null
+fi
+
+# --- 2. delegate to the previous statusline ------------------------------------
+DELEGATE=""
+[[ -r "$CFG" ]] && command -v jq >/dev/null 2>&1 && \
+  DELEGATE=$(jq -r '.statuslineDelegate // empty' "$CFG" 2>/dev/null)
+
+if [[ -n "$DELEGATE" ]]; then
+  printf '%s' "$IN" | eval "$DELEGATE"
+  exit $?
+fi
+
+# --- 3. no delegate: print our own line ----------------------------------------
+printf '%s' "$IN" | jq -r '
+  [ (.model.display_name // empty),
+    (.workspace.current_dir // "" | split("/") | last // empty),
+    (if .rate_limits.five_hour then "5h " + (.rate_limits.five_hour.used_percentage|floor|tostring) + "%" else empty end),
+    (if .rate_limits.seven_day then "7d " + (.rate_limits.seven_day.used_percentage|floor|tostring) + "%" else empty end)
+  ] | map(select(. != "")) | join(" · ")' 2>/dev/null

@@ -1,0 +1,16 @@
+{
+  "name": "dont-stop",
+  "description": "Pauses the session when the 5-hour usage window runs out and resumes it automatically once it resets. Stops and warns you if the weekly cap is what ran out.",
+  "version": "1.0.0",
+  "author": {
+    "name": "gry",
+    "url": "https://github.com/gry"
+  },
+  "keywords": [
+    "usage",
+    "rate-limit",
+    "long-run",
+    "hooks"
+  ],
+  "homepage": "https://github.com/gry/claude-dont-stop"
+}

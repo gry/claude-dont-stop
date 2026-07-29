@@ -1,0 +1,14 @@
+{
+  "name": "claude-dont-stop",
+  "owner": {
+    "name": "gry",
+    "url": "https://github.com/gry"
+  },
+  "plugins": [
+    {
+      "name": "dont-stop",
+      "source": "./",
+      "description": "Automatically waits for the usage window to reset and resumes the work."
+    }
+  ]
+}

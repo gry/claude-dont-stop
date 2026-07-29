@@ -1,0 +1,68 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/dont-stop-context",
+            "timeout": 25
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/dont-stop-context",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/dont-stop-gate",
+            "asyncRewake": true,
+            "statusMessage": "dont-stop: esperando el reset de la ventana de uso",
+            "rewakeSummary": "dont-stop: reanudado tras el reset de la ventana",
+            "timeout": 86400
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/dont-stop-gate",
+            "asyncRewake": true,
+            "statusMessage": "dont-stop: rate limit, esperando el reset",
+            "rewakeSummary": "dont-stop: reanudado tras el rate limit",
+            "timeout": 86400
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/dont-stop-gate",
+            "asyncRewake": true,
+            "statusMessage": "dont-stop: subagente esperando el reset",
+            "rewakeSummary": "dont-stop: subagente reanudado tras el reset",
+            "timeout": 86400
+          }
+        ]
+      }
+    ]
+  }
+}

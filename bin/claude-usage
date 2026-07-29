@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+# claude-usage — state of the Claude account's usage windows.
+#
+#   claude-usage              compact human-readable line
+#   claude-usage --json       raw endpoint response
+#   claude-usage --norm       normalised one-line JSON (what the gate consumes)
+#   claude-usage --wait-secs  seconds until the 5h window resets
+#   claude-usage --gate [N]   exit 0 if work can continue (threshold N, default 95)
+#
+# Flags: --fresh (ignore caches) · --ttl N (endpoint cache TTL, default 60)
+#        --no-statusline (skip the statusline cache, force the endpoint)
+#        --cache-only (never touch the network; fails if no usable cache)
+#
+# --gate exit codes:
+#   0  keep going
+#   1  5h window exhausted      -> waiting for the 5h reset makes sense
+#   2  error
+#   3  WEEKLY cap exhausted and its reset is far away -> waiting is pointless, stop
+#   4  WEEKLY cap exhausted but its reset is near     -> wait for the weekly reset
+#
+# TWO DATA SOURCES, in order of preference:
+#  1. The cache written by `dont-stop-statusline`. Claude Code hands `rate_limits`
+#     to the statusLine command on every render, so it is free, needs no network
+#     and has no rate limit. This is the normal source.
+#  2. GET /api/oauth/usage (the same endpoint /usage uses), with the OAuth token
+#     from ~/.claude/.credentials.json. This is the fallback: before the first API
+#     response, in sessions without a statusline, and to re-verify after waking.
+#     CAREFUL: it has its own aggressive rate limit (~7 calls in 4 min -> HTTP
+#     429, and the 429 lasts ~4 min even if you stop calling), which is why the
+#     response is cached on disk and a 429 serves the previous copy marked stale.
+#     Never poll: sleep exactly as long as --wait-secs says.
+
+set -uo pipefail
+# The user's locale may use a decimal comma, which makes printf '%.0f' "37.0"
+# fail. We always round with jq, and pin LC_NUMERIC just in case.
+export LC_NUMERIC=C
+
+CREDS="${HOME}/.claude/.credentials.json"
+ENDPOINT="https://api.anthropic.com/api/oauth/usage"
+DS_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/claude-dont-stop"
+SL_CACHE="$DS_DIR/rate_limits.json"     # written by dont-stop-statusline
+EP_CACHE="$DS_DIR/usage.json"           # raw endpoint response
+SL_MAX_AGE="${CLAUDE_DONT_STOP_SL_MAX_AGE:-300}"
+TTL="${CLAUDE_USAGE_TTL:-60}"
+FRESH=0
+USE_SL=1
+CACHE_ONLY=0
+MODE=""
+GATE_LIMIT="${CLAUDE_DONT_STOP_THRESHOLD:-95}"
+WEEKLY_LIMIT="${CLAUDE_DONT_STOP_WEEKLY_LIMIT:-99}"
+WEEKLY_MAX_WAIT="${CLAUDE_DONT_STOP_WEEKLY_MAX_WAIT:-28800}"   # 8h
+
+die() { printf 'claude-usage: %s\n' "$1" >&2; exit 2; }
+
+while (( $# )); do
+  case "$1" in
+    --json|--wait-secs|--line|--norm) MODE="$1"; shift ;;
+    --gate) MODE="--gate"; shift
+            [[ "${1:-}" =~ ^[0-9]+$ ]] && { GATE_LIMIT="$1"; shift; } ;;
+    --fresh) FRESH=1; shift ;;
+    --no-statusline) USE_SL=0; shift ;;
+    --cache-only) CACHE_ONLY=1; shift ;;
+    --ttl) TTL="${2:?--ttl needs a number}"; shift 2 ;;
+    -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) die "unknown option: $1" ;;
+  esac
+done
+MODE="${MODE:---line}"
+
+command -v jq >/dev/null || die "jq is required"
+
+now() { date +%s; }
+age_of() { local f=$1; echo $(( $(now) - $(stat -c %Y "$f" 2>/dev/null || echo 0) )); }
+
+# --- source 1: the statusline cache -------------------------------------------
+# Written by dont-stop-statusline from the rate_limits block Claude Code passes
+# it. It carries no extra_usage (the statusline never receives it), so that is
+# reported as unknown.
+read_statusline() {
+  (( USE_SL )) || return 1
+  [[ -s "$SL_CACHE" ]] || return 1
+  local age; age=$(age_of "$SL_CACHE")
+  (( age <= SL_MAX_AGE )) || return 1
+  jq -e --argjson age "$age" '
+    select(.five_pct != null) |
+    { five_pct, five_reset, week_pct, week_reset,
+      extra_enabled: null, extra_pct: null,
+      source: "statusline", age: $age, stale: false }' "$SL_CACHE" 2>/dev/null
+}
+
+# --- source 2: the endpoint (with its own cache) ------------------------------
+fetch_endpoint() {
+  (( CACHE_ONLY )) && return 1
+  [[ -r "$CREDS" ]] || { echo "cannot read $CREDS" >&2; return 1; }
+  local token exp now_ms resp code body
+  token=$(jq -r '.claudeAiOauth.accessToken // empty' "$CREDS")
+  [[ -n "$token" ]] || { echo "no accessToken in $CREDS" >&2; return 1; }
+
+  # The OAuth token expires; Claude Code refreshes it on its own and rewrites the
+  # file, so re-reading it on every call is usually enough. Warn if it lapsed.
+  exp=$(jq -r '.claudeAiOauth.expiresAt // 0' "$CREDS")
+  now_ms=$(( $(now) * 1000 ))
+  if [[ "$exp" != "0" && "$now_ms" -gt "$exp" ]]; then
+    printf 'claude-usage: warning, the accessToken expired on %s (start Claude Code to refresh it)\n' \
+      "$(date -d "@$((exp / 1000))" 2>/dev/null)" >&2
+  fi
+
+  resp=$(curl -sS --max-time 20 -w '\n%{http_code}' "$ENDPOINT" \
+    -H "Authorization: Bearer $token" \
+    -H "anthropic-beta: oauth-2025-04-20") || return 1
+  code=${resp##*$'\n'}
+  body=${resp%$'\n'*}
+
+  if [[ "$code" == "200" ]]; then
+    mkdir -p "$DS_DIR"
+    printf '%s' "$body" > "$EP_CACHE.tmp" && mv "$EP_CACHE.tmp" "$EP_CACHE"
+    printf '%s' "$body"
+    return 0
+  fi
+  printf 'claude-usage: HTTP %s%s\n' "$code" \
+    "$([[ $code == 429 ]] && printf " (the endpoint's own rate limit)")" >&2
+  return 1
+}
+
+# Returns the raw endpoint body (fresh cache > network > stale cache).
+RAW=""; RAW_STALE=0; RAW_AGE=0
+load_endpoint() {
+  [[ -n "$RAW" ]] && return 0
+  local age; age=$(age_of "$EP_CACHE")
+  if (( FRESH == 0 )) && [[ -s "$EP_CACHE" ]] && (( age < TTL )); then
+    RAW=$(<"$EP_CACHE"); RAW_AGE=$age; return 0
+  fi
+  if RAW=$(fetch_endpoint); then RAW_AGE=0; return 0; fi
+  if [[ -s "$EP_CACHE" ]]; then
+    RAW=$(<"$EP_CACHE"); RAW_AGE=$(age_of "$EP_CACHE"); RAW_STALE=1
+    printf 'claude-usage: serving stale cache (%ss)\n' "$RAW_AGE" >&2
+    return 0
+  fi
+  return 1
+}
+
+norm_from_endpoint() {
+  load_endpoint || return 1
+  jq -e --argjson age "$RAW_AGE" --argjson stale "$RAW_STALE" '
+    def ep: (. // "") | if . == "" then null else (sub("\\.[0-9]+";"") | fromdateiso8601) end;
+    { five_pct:  (.five_hour.utilization // 0),
+      five_reset: (.five_hour.resets_at | ep),
+      week_pct:  (.seven_day.utilization // 0),
+      week_reset: (.seven_day.resets_at | ep),
+      extra_enabled: (.extra_usage.is_enabled // false),
+      extra_pct: (.extra_usage.utilization // null),
+      source: "endpoint", age: $age, stale: ($stale == 1) }' <<<"$RAW" 2>/dev/null
+}
+
+# NORM: the normalised JSON everything else consumes.
+NORM=""
+load_norm() {
+  [[ -n "$NORM" ]] && return 0
+  if (( FRESH == 0 )) && NORM=$(read_statusline) && [[ -n "$NORM" ]]; then return 0; fi
+  if NORM=$(norm_from_endpoint) && [[ -n "$NORM" ]]; then return 0; fi
+  NORM=""
+  return 1
+}
+
+nget() { jq -r --arg k "$1" '.[$k] // empty' <<<"$NORM"; }
+pct()  { jq -r --arg k "$1" '((.[$k] // 0) | floor)' <<<"$NORM" 2>/dev/null || echo 0; }
+secs_until() { local t=$1; [[ -z "$t" || "$t" == "null" ]] && { echo 0; return; }
+               local s=$(( t - $(now) )); (( s < 0 )) && s=0; echo "$s"; }
+hhmm() { local t=$1; [[ -z "$t" || "$t" == "null" ]] && { echo "?"; return; }
+         date -d "@$t" '+%H:%M %Z'; }
+
+case "$MODE" in
+  --json)
+    load_endpoint || die "no data: the request failed and there is no cache"
+    jq . <<<"$RAW" ;;
+
+  --norm)
+    load_norm || die "no usage data (neither statusline nor endpoint)"
+    jq -c . <<<"$NORM" ;;
+
+  --wait-secs)
+    load_norm || die "no usage data"
+    secs_until "$(nget five_reset)" ;;
+
+  --gate)
+    load_norm || die "no usage data"
+    FIVE=$(pct five_pct); WEEK=$(pct week_pct)
+    FRESET=$(nget five_reset); WRESET=$(nget week_reset)
+    SRC=$(nget source)
+    TAG=""; [[ "$(jq -r '.stale' <<<"$NORM")" == "true" ]] && TAG=" [stale]"
+    TAG="$TAG [$SRC]"
+
+    # The weekly cap wins: if it is exhausted, waiting for the 5h reset unblocks
+    # nothing.
+    if (( WEEK >= WEEKLY_LIMIT )); then
+      WWAIT=$(secs_until "$WRESET")
+      if (( WWAIT > 0 && WWAIT <= WEEKLY_MAX_WAIT )); then
+        printf 'BLOCKED_WEEKLY_WAIT 5h=%s%% 7d=%s%% deadline=%s wait_secs=%s reset=%s%s\n' \
+          "$FIVE" "$WEEK" "$WRESET" "$WWAIT" "$(date -d "@$WRESET" '+%a %d %H:%M %Z')" "$TAG"
+        exit 4
+      fi
+      printf 'BLOCKED_WEEKLY 5h=%s%% 7d=%s%% reset=%s wait_secs=%s%s\n' \
+        "$FIVE" "$WEEK" "$(date -d "@${WRESET:-0}" '+%a %d %H:%M %Z' 2>/dev/null || echo '?')" \
+        "$WWAIT" "$TAG"
+      exit 3
+    fi
+
+    if (( FIVE >= GATE_LIMIT )); then
+      SECS=$(secs_until "$FRESET")
+      printf 'BLOCKED_5H 5h=%s%% (>=%s%%) 7d=%s%% deadline=%s wait_secs=%s reset=%s%s\n' \
+        "$FIVE" "$GATE_LIMIT" "$WEEK" "$FRESET" "$SECS" "$(hhmm "$FRESET")" "$TAG"
+      exit 1
+    fi
+
+    printf 'OK 5h=%s%% 7d=%s%% reset=%s%s\n' "$FIVE" "$WEEK" "$(hhmm "$FRESET")" "$TAG"
+    ;;
+
+  --line)
+    load_norm || die "no usage data"
+    SECS=$(secs_until "$(nget five_reset)")
+    EXTRA=$(jq -r 'if .extra_enabled == null then "extra ?"
+                   elif .extra_enabled then "extra " + ((.extra_pct // 0)|floor|tostring) + "%"
+                   else "extra off" end' <<<"$NORM")
+    TAG=""; [[ "$(jq -r '.stale' <<<"$NORM")" == "true" ]] && TAG=" [stale]"
+    printf '5h %s%% | 7d %s%% | %s | 5h reset %s (in %dh%02dm)%s\n' \
+      "$(pct five_pct)" "$(pct week_pct)" "$EXTRA" \
+      "$(hhmm "$(nget five_reset)")" $(( SECS / 3600 )) $(( SECS % 3600 / 60 )) "$TAG"
+    ;;
+esac

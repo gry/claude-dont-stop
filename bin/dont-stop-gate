@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# dont-stop-gate — boundary hook: decides whether to wait for the usage window to
+# reset and, if so, waits and revives the session.
+#
+# Installed on Stop, StopFailure and SubagentStop, all with "asyncRewake": true.
+# asyncRewake means: the hook runs in the background (never blocking the UI) and,
+# if it exits with code 2, Claude Code wakes the model and hands it the hook's
+# stderr. Verified on 2.1.220 across all three events.
+#
+# KEY IDEA: we sleep until an ABSOLUTE INSTANT (resets_at), never for "N seconds".
+# That way, if the main thread and several subagents all decide to wait at once,
+# they wake at the same moment instead of chaining their waits; and whoever joins
+# late sleeps zero. The wait is idempotent by construction.
+#
+# Outcomes:
+#   exit 0          nothing to do (the normal case, ~5 ms reading a cache file)
+#   exit 2 + stderr we waited and are now waking the model with instructions
+#   stdout JSON     systemMessage to notify you in chat (weekly cap exhausted)
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+USAGE_BIN="${CLAUDE_DONT_STOP_USAGE_BIN:-$HERE/claude-usage}"
+CFG="${CLAUDE_DONT_STOP_CONFIG:-$HOME/.claude/dont-stop.json}"
+DS_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/claude-dont-stop"
+LOG="$DS_DIR/dont-stop.log"
+DEADLINE_F="$DS_DIR/deadline"       # instant shared by everyone who is waiting
+mkdir -p "$DS_DIR" 2>/dev/null
+
+IN=$(cat)
+jq_in() { jq -r "$1" <<<"$IN" 2>/dev/null; }
+
+EVENT=$(jq_in '.hook_event_name // "?"')
+AGENT=$(jq_in '.agent_type // empty')
+WHO="${AGENT:+subagent $AGENT}"; WHO="${WHO:-main session}"
+log() { printf '%s [%s/%s] %s\n' "$(date '+%F %T')" "$EVENT" "$WHO" "$*" >> "$LOG"; }
+
+cfg() { # cfg <key> <default>
+  # CAREFUL: never '.[$k] // empty'. In jq, a // b yields b when a is null OR
+  # false, so a `"enabled": false` would read as "unset" and fall back to the
+  # default true — the off switch simply would not work.
+  local v=""
+  [[ -r "$CFG" ]] && command -v jq >/dev/null 2>&1 && \
+    v=$(jq -r --arg k "$1" 'if has($k) and .[$k] != null then .[$k] else empty end' "$CFG" 2>/dev/null)
+  [[ -n "$v" ]] && printf '%s' "$v" || printf '%s' "$2"
+}
+
+# ---- 1. are we on? ------------------------------------------------------------
+# The per-session switch (environment variable) wins over the config file.
+ENABLED=$(cfg enabled true)
+case "${CLAUDE_DONT_STOP:-}" in
+  0|false|off|no) ENABLED=false ;;
+  1|true|on|yes)  ENABLED=true  ;;
+esac
+[[ "$ENABLED" == "true" ]] || exit 0
+
+# ---- 2. loop guard ------------------------------------------------------------
+# Claude Code sets stop_hook_active once we have already blocked this turn from
+# ending. Waiting again here would loop and hit the consecutive-block cap.
+[[ "$(jq_in '.stop_hook_active')" == "true" ]] && { log "stop_hook_active -> no-op"; exit 0; }
+
+# ---- 3. StopFailure: only rate limits concern us ------------------------------
+API_ERR=$(jq_in '.error // empty')
+FORCED=0
+if [[ "$EVENT" == "StopFailure" ]]; then
+  [[ "$API_ERR" == "rate_limit" ]] || { log "error=$API_ERR, not a rate_limit -> no-op"; exit 0; }
+  FORCED=1   # the API already said no: the percentage no longer matters
+fi
+
+THRESHOLD=$(cfg threshold 95)
+[[ -n "${CLAUDE_DONT_STOP_THRESHOLD:-}" ]] && THRESHOLD="$CLAUDE_DONT_STOP_THRESHOLD"
+MAX_SLEEP=$(cfg maxSleepSecs 21600)
+GRACE=$(cfg graceSecs 60)
+WEEKLY_MAX_WAIT=$(cfg weeklyMaxWaitSecs 28800)
+
+# ---- 4. ask the gate ----------------------------------------------------------
+export CLAUDE_DONT_STOP_WEEKLY_MAX_WAIT="$WEEKLY_MAX_WAIT"
+GATE_OUT=$("$USAGE_BIN" --gate "$THRESHOLD" 2>>"$LOG"); GATE_RC=$?
+log "gate rc=$GATE_RC :: $GATE_OUT"
+
+field() { sed -n "s/.*\b$1=\([^ ]*\).*/\1/p" <<<"$GATE_OUT"; }
+
+DEADLINE=""; REASON=""
+case "$GATE_RC" in
+  0)  if (( FORCED )); then
+        # The API returned 429 even though the percentage did not give it away
+        # (or the data was stale). Trust the API: wait for the 5h window reset.
+        DEADLINE=$("$USAGE_BIN" --norm --fresh 2>>"$LOG" | jq -r '.five_reset // empty')
+        REASON="the API returned a rate limit"
+      else
+        exit 0
+      fi ;;
+  1)  DEADLINE=$(field deadline); REASON="the 5h window reached ${THRESHOLD}%" ;;
+  4)  DEADLINE=$(field deadline); REASON="the weekly cap is exhausted and its reset is near" ;;
+  3)  # Weekly cap exhausted with its reset days away: sleeping fixes nothing.
+      RESET_H=$(sed -n 's/.*reset=\(.*\) wait_secs.*/\1/p' <<<"$GATE_OUT")
+      MSG="dont-stop: WEEKLY CAP EXHAUSTED ($GATE_OUT). Not sleeping: it resets on ${RESET_H:-?}, too far away. Stopping here."
+      log "$MSG"
+      jq -nc --arg m "$MSG" '{systemMessage:$m}'
+      exit 0 ;;
+  *)  if (( FORCED )); then
+        DEADLINE=$(( $(date +%s) + 900 ))   # no data but a 429: retry in 15 min
+        REASON="a rate limit with no reliable usage data"
+      else
+        log "gate error -> no-op"; exit 0
+      fi ;;
+esac
+
+[[ "$DEADLINE" =~ ^[0-9]+$ ]] || { log "non-numeric deadline ('$DEADLINE') -> no-op"; exit 0; }
+
+# ---- 5. shared deadline -------------------------------------------------------
+NOW=$(date +%s)
+if (( DEADLINE <= NOW )); then
+  # The reset already happened (stale data, or the clock caught up while we were
+  # deciding). Nothing to wait for: the grace margin only applies to future
+  # resets, adding it to a past instant would mean sleeping for nothing.
+  log "the reset had already passed, not sleeping"
+  echo "dont-stop: the usage window has already reset. Carry on with the work where you left off." >&2
+  exit 2
+fi
+
+TARGET=$(( DEADLINE + GRACE ))
+# If another hook (main thread or a subagent) already fixed a shared instant and
+# it is reasonable, join theirs: that way everyone wakes at the same time.
+if [[ -s "$DEADLINE_F" ]]; then
+  PREV=$(<"$DEADLINE_F")
+  if [[ "$PREV" =~ ^[0-9]+$ ]] && (( PREV > NOW && PREV <= TARGET + 3600 )); then
+    TARGET="$PREV"
+  fi
+fi
+printf '%s' "$TARGET" > "$DEADLINE_F"
+WAIT=$(( TARGET - NOW ))
+
+if (( WAIT > MAX_SLEEP )); then
+  MSG="dont-stop: the computed wait (${WAIT}s) exceeds maxSleepSecs (${MAX_SLEEP}s). Not sleeping. $GATE_OUT"
+  log "$MSG"; jq -nc --arg m "$MSG" '{systemMessage:$m}'; exit 0
+fi
+
+# ---- 6. wait ------------------------------------------------------------------
+HH=$(date -d "@$TARGET" '+%H:%M %Z')
+if   (( WAIT < 60 ));   then HR="${WAIT}s"
+elif (( WAIT < 3600 )); then HR="$(( WAIT/60 )) min"
+else HR=$(printf '%dh%02dm' $(( WAIT/3600 )) $(( WAIT%3600/60 ))); fi
+log "sleeping ${WAIT}s (until $HH) because $REASON"
+sleep "$WAIT"
+log "waking up"
+
+# Re-verify with fresh data: no API responses arrived while we slept, so the
+# statusline cache is stale by definition. (Tests set --cache-only here so they
+# do not burn the endpoint's rate limit on every run.)
+POSTCHECK="${CLAUDE_DONT_STOP_POSTCHECK_FLAGS:---fresh}"
+POST=$("$USAGE_BIN" --gate "$THRESHOLD" $POSTCHECK 2>>"$LOG"); POST_RC=$?
+log "post-check rc=$POST_RC :: $POST"
+if (( POST_RC == 1 || POST_RC == 4 )); then
+  # Still blocked (the reset moved, or another session consumed the budget). One
+  # more short round, and only if there is real time left to wait: if wait_secs
+  # is already 0 but the percentage stays high, sleeping more will not fix it —
+  # let the next Stop re-evaluate instead of chaining waits here.
+  EXTRA=$(sed -n 's/.*wait_secs=\([0-9]*\).*/\1/p' <<<"$POST"); EXTRA=${EXTRA:-0}
+  if (( EXTRA > 0 )); then
+    (( EXTRA > MAX_SLEEP )) && EXTRA=$MAX_SLEEP
+    log "still blocked, ${EXTRA}s more"
+    sleep "$(( EXTRA + GRACE ))"
+    POST=$("$USAGE_BIN" --gate "$THRESHOLD" $POSTCHECK 2>>"$LOG")
+  else
+    log "still blocked but no wait pending; the next Stop will re-evaluate"
+  fi
+fi
+rm -f "$DEADLINE_F" 2>/dev/null
+
+cat >&2 <<EOF
+dont-stop: the work was paused because $REASON. I waited $HR, until $HH, and the
+usage window has now reset ($POST).
+
+Resume exactly where you left off, without starting over and without asking for
+confirmation. Begin your reply with one line saying you were paused for $HR
+waiting for the usage window to reset, then continue with the task.
+EOF
+exit 2
