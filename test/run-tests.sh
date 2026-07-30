@@ -112,8 +112,10 @@ check "CLAUDE_DONT_STOP=0 overrides the config -> no-op" "$RC" 0
 OUT=$(run_gate_hook '{"hook_event_name":"Stop","stop_hook_active":true}'); RC=$?
 check "stop_hook_active:true -> no-op (loop guard)" "$RC" 0
 
-OUT=$(run_gate_hook '{"hook_event_name":"StopFailure","error":"overloaded","stop_hook_active":false}'); RC=$?
-check "StopFailure that is not a rate_limit -> no-op" "$RC" 0
+# 'overloaded' is deliberately NOT used here: it is a transient failure and is
+# meant to be retried. Use one that waiting genuinely cannot fix.
+OUT=$(run_gate_hook '{"hook_event_name":"StopFailure","error":"authentication_failed","stop_hook_active":false}'); RC=$?
+check "StopFailure that is neither a rate limit nor transient -> no-op" "$RC" 0
 
 seed 10 5400 20 400000         # low usage: nothing to do
 OUT=$(run_gate_hook '{"hook_event_name":"Stop","stop_hook_active":false}'); RC=$?
@@ -171,6 +173,58 @@ ELAPSED=$(( $(date +%s) - START ))
 check "wait > maxSleepSecs -> exit 0 without sleeping" "$RC" 0
 [[ $ELAPSED -lt 5 ]] && ok "  and does not hang" || bad "  it hung" "${ELAPSED}s"
 has   "  explaining why" "$OUT" "maxSleepSecs"
+
+echo
+echo "== transient API failures (stream died mid-response) =="
+rm -f "$DS"/transient-* "$DS"/wakes-*
+seed 30 5400 20 400000      # plenty of budget left: this is NOT a usage problem
+cfg '{enabled:true, threshold:95, transientBackoffSecs:"1 1 1", maxTransientRetries:2}'
+SF='{"hook_event_name":"StopFailure","error":"server_error","session_id":"t1","stop_hook_active":false}'
+
+START=$(date +%s)
+OUT=$(printf '%s' "$SF" | "$BIN/dont-stop-gate" 2>"$TMP/terr"); RC=$?
+check "server_error -> exit 2 (resumes the turn)" "$RC" 2
+[[ $(( $(date +%s) - START )) -lt 10 ]] && ok "  after a short backoff, not a window wait" \
+  || bad "  waited far too long" "$(( $(date +%s) - START ))s"
+E=$(cat "$TMP/terr")
+has "  explains it was a transient failure" "$E" "transient API failure"
+has "  warns about the dangling tool call (idempotency)" "$E" "may have executed"
+has "  and forbids starting over" "$E" "do not start the task over"
+
+printf '%s' "$SF" | "$BIN/dont-stop-gate" >/dev/null 2>&1; RC=$?
+check "second occurrence still retries (within budget)" "$RC" 2
+OUT=$(printf '%s' "$SF" | "$BIN/dont-stop-gate" 2>/dev/null); RC=$?
+check "third exceeds maxTransientRetries -> stops retrying" "$RC" 0
+has "  and says why, instead of failing silently" "$OUT" "looks persistent"
+
+# Errors that waiting cannot fix must be left alone.
+for e in authentication_failed billing_error invalid_request model_not_found; do
+  R=$(printf '{"hook_event_name":"StopFailure","error":"%s","session_id":"t2","stop_hook_active":false}' "$e" \
+      | "$BIN/dont-stop-gate" >/dev/null 2>&1; echo $?)
+  [[ "$R" == "0" ]] || bad "$e must be left alone" "got exit $R"
+done
+ok "auth/billing/invalid/model errors are left alone (waiting cannot fix them)"
+
+# The rate_limit path must be untouched by any of this.
+rm -f "$DS"/transient-* "$DS"/wakes-*
+seed 100 5400 51 400000
+cfg '{enabled:true, threshold:95, maxSleepSecs:60}'
+OUT=$(printf '{"hook_event_name":"StopFailure","error":"rate_limit","session_id":"t3","stop_hook_active":false}' \
+      | "$BIN/dont-stop-gate" 2>/dev/null); RC=$?
+check "rate_limit still takes the window-wait path, not the retry path" "$RC" 0
+has "  (capped here by maxSleepSecs)" "$OUT" "maxSleepSecs"
+
+echo
+echo "== dont-stop-dump: records, decides nothing =="
+D="$TMP/payloads.jsonl"; rm -f "$D"
+cfg '{enabled:true}'
+OUT=$(printf '%s' "$SF" | "$BIN/dont-stop-dump"); RC=$?
+check "silent and inert when no dumpPath is set" "$OUT" ""
+[[ -f "$D" ]] && bad "wrote a file it was not asked to" "$D" || ok "  and writes nothing"
+cfg "{enabled:true, dumpPath:\"$D\"}"
+printf '%s' "$SF" | "$BIN/dont-stop-dump" >/dev/null 2>&1
+jq -e 'select(.hook_event_name=="StopFailure") | .error == "server_error" and (.ts|length)>0' "$D" >/dev/null 2>&1 \
+  && ok "records the payload with .error intact and a timestamp" || bad "bad dump" "$(cat "$D" 2>/dev/null)"
 
 echo
 echo "== wake cap (SubagentStop has no stop_hook_active of its own) =="

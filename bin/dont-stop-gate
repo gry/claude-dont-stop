@@ -72,7 +72,11 @@ prune_wakes() {
     [[ "$t" =~ ^[0-9]+$ ]] && (( t > cutoff )) && kept+="$t"$'\n'
   done < "$WAKE_F"
   printf '%s' "$kept" > "$WAKE_F"
-  printf '%s' "$kept" | grep -c . 2>/dev/null || echo 0
+  # grep -c prints 0 AND exits 1 when nothing matches, so a `|| echo 0` fallback
+  # would emit a second 0 and hand "0\n0" to the arithmetic below.
+  local n; n=$(printf '%s' "$kept" | grep -c . 2>/dev/null) || true
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  printf '%s' "$n"
 }
 RECENT=$(prune_wakes)
 if (( RECENT >= WAKE_CAP )); then
@@ -81,12 +85,75 @@ if (( RECENT >= WAKE_CAP )); then
 fi
 record_wake() { date +%s >> "$WAKE_F"; }
 
-# ---- 3. StopFailure: only rate limits concern us ------------------------------
+# ---- 3. StopFailure: rate limits, and transient failures -----------------------
+# Two different problems needing two different remedies:
+#
+#   rate_limit    -> the usage window is spent. Wait for the reset (hours).
+#   server_error, -> the stream died mid-response. Nothing is "spent"; waiting for
+#   overloaded       a window reset would be absurd. A short backoff and a retry
+#                    is the fix. Observed in the wild: the turn just ends (a
+#                    turn_duration record follows) and nothing retries, leaving
+#                    the session idle until a human types "continue".
+#
+# Anything else is deliberately left alone: authentication_failed, billing_error
+# and friends are not fixed by waiting, and looping on them would burn budget.
 API_ERR=$(jq_in '.error // empty')
-FORCED=0
+FORCED=0; TRANSIENT=0
 if [[ "$EVENT" == "StopFailure" ]]; then
-  [[ "$API_ERR" == "rate_limit" ]] || { log "error=$API_ERR, not a rate_limit -> no-op"; exit 0; }
-  FORCED=1   # the API already said no: the percentage no longer matters
+  TRANSIENT_LIST=$(cfg transientErrors "server_error overloaded")
+  if [[ "$API_ERR" == "rate_limit" ]]; then
+    FORCED=1   # the API already said no: the percentage no longer matters
+  elif [[ " $TRANSIENT_LIST " == *" $API_ERR "* ]]; then
+    TRANSIENT=1
+  else
+    log "error=$API_ERR, neither a rate limit nor transient -> no-op"; exit 0
+  fi
+fi
+
+if (( TRANSIENT )); then
+  # Budget: a stream that breaks because the request is too large will break the
+  # same way on retry. Escalating backoff, hard cap, per session, self-pruning.
+  MAX_RETRIES=$(cfg maxTransientRetries 3)
+  WINDOW=$(cfg transientWindowSecs 900)
+  SESSION_T=$(jq_in '.session_id // "nosession"')
+  TF="$DS_DIR/transient-${SESSION_T//[^A-Za-z0-9_-]/_}"
+  CUTOFF=$(( $(date +%s) - WINDOW )); KEPT=""
+  [[ -s "$TF" ]] && while read -r t; do
+    [[ "$t" =~ ^[0-9]+$ ]] && (( t > CUTOFF )) && KEPT+="$t"$'\n'
+  done < "$TF"
+  printf '%s' "$KEPT" > "$TF"
+  TRIES=$(printf '%s' "$KEPT" | grep -c . 2>/dev/null) || true
+  [[ "$TRIES" =~ ^[0-9]+$ ]] || TRIES=0
+
+  if (( TRIES >= MAX_RETRIES )); then
+    MSG="dont-stop: the turn died with '$API_ERR' and has already been retried ${TRIES}x in the last $(( WINDOW / 60 ))min. Not retrying again — this looks persistent rather than transient. Check the connection, or split the work into smaller steps."
+    log "$MSG"; jq -nc --arg m "$MSG" '{systemMessage:$m}'; exit 0
+  fi
+
+  # 5s, 20s, 60s, ... — quick enough to feel automatic, slow enough to let a
+  # blip pass.
+  read -r -a BACKOFFS <<< "$(cfg transientBackoffSecs "5 20 60")"
+  DELAY=${BACKOFFS[$TRIES]:-${BACKOFFS[-1]}}
+  log "transient '$API_ERR' (retry $((TRIES+1))/$MAX_RETRIES), backing off ${DELAY}s"
+  date +%s >> "$TF"
+  sleep "$DELAY"
+  log "retrying after transient '$API_ERR'"
+
+  # Idempotency matters here in a way it does not for a rate-limit wait: the turn
+  # was cut mid-flight, so a tool call may have run without its result being
+  # recorded. Resuming is not the same as repeating.
+  cat >&2 <<EOF
+dont-stop: the previous turn was cut short by a transient API failure ($API_ERR)
+-- the connection dropped mid-response, so your last message may be incomplete.
+Nothing is wrong with the usage window; I waited ${DELAY}s and you can continue.
+
+Before redoing anything, check the current state: a tool call may have executed
+without its result reaching you. Re-read the file, re-run the status command, or
+otherwise confirm what actually landed, and only then carry on. Do not blindly
+repeat the last action, and do not start the task over.
+EOF
+  record_wake
+  exit 2
 fi
 
 THRESHOLD=$(cfg threshold 95)

@@ -132,6 +132,53 @@ the settings wiring, which is what you want if the statusLine setup changed.
 The volume is optional but saves you reinstalling and re-authenticating every time
 the container is rebuilt.
 
+## When a stream dies mid-response
+
+Separate from usage limits, a turn can die with:
+
+```
+API Error: Connection closed mid-response. The response above may be incomplete.
+```
+
+Observed behaviour: the turn simply ends (a `turn_duration` record follows) and
+**nothing retries** — the session sits idle until a human types "continue".
+Measured idle time on two real occurrences: 3 and 17 minutes.
+
+dont-stop treats this as a different problem with a different remedy. Waiting for
+a usage-window reset would be absurd; nothing is spent. Instead it backs off
+briefly (5s, 20s, 60s by default) and resumes the turn.
+
+| Error | Remedy |
+|---|---|
+| `rate_limit` | wait for the window reset (hours) |
+| `server_error`, `overloaded` | short backoff, then resume |
+| `authentication_failed`, `billing_error`, `invalid_request`, `model_not_found` | left alone — waiting cannot fix these |
+
+Bounded by `maxTransientRetries` (default 3 per 15 min, per session): a stream
+that breaks because the request is too large will break the same way on retry, so
+after the budget runs out it stops and tells you rather than looping.
+
+The resume instruction is deliberately idempotency-aware. The turn was cut
+mid-flight, so a tool call may have run without its result being recorded;
+the model is told to verify what actually landed before repeating anything.
+
+### Verifying it on your machine
+
+Whether `StopFailure` fires for this case is not something a synthetic
+reproduction can settle — cutting a stream locally lands in a different path
+(`terminal_reason: "aborted_streaming"`, no hook fires at all). To capture a real
+occurrence:
+
+```bash
+dont-stop-ctl dump on      # records every hook payload verbatim
+# ... work until it happens ...
+dont-stop-ctl dump         # shows the StopFailure payloads that were captured
+dont-stop-ctl dump off
+```
+
+Key on the structured field `.error`, never on the message text: quoting the
+error string in a prompt produces false positives.
+
 ## Configuration
 
 `~/.claude/dont-stop.json`:
@@ -145,6 +192,12 @@ the container is rebuilt.
 | `weeklyMaxWaitSecs` | `28800` (8h) | how long it will wait for the **weekly** reset |
 | `graceSecs` | `60` | margin after the reset before resuming |
 | `statuslineDelegate` | — | your previous statusLine, invoked by the wrapper |
+| `transientErrors` | `"server_error overloaded"` | API errors treated as transient and retried |
+| `transientBackoffSecs` | `"5 20 60"` | escalating backoff between retries |
+| `maxTransientRetries` | `3` | retry budget per `transientWindowSecs` |
+| `transientWindowSecs` | `900` | window the retry budget is counted over |
+| `maxWakesPerWindow` | `3` | hard cap on model wake-ups per session |
+| `dumpPath` | — | when set, every hook payload is recorded there |
 
 Per-session overrides (these win over the file):
 

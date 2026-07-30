@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# dont-stop-dump — records hook payloads verbatim, decides nothing.
+#
+# Exists to settle questions that cannot be answered by reading the binary or by
+# synthetic reproduction. Notably: does StopFailure actually fire when a stream
+# dies with error "server_error"? Locally reproducing a cut stream lands in a
+# different path (terminal_reason "aborted_streaming", no hook fires at all), so
+# the only reliable evidence comes from a real occurrence.
+#
+# Off unless you turn it on. Enable with:
+#   dont-stop-ctl dump on          -> ~/.cache/claude-dont-stop/payloads.jsonl
+#   dont-stop-ctl dump off
+# or set "dumpPath" in ~/.claude/dont-stop.json.
+#
+# Always exits 0 and prints nothing, so it can never affect a turn.
+
+set -uo pipefail
+CFG="${CLAUDE_DONT_STOP_CONFIG:-$HOME/.claude/dont-stop.json}"
+DS_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/claude-dont-stop"
+
+IN=$(cat)
+DUMP=""
+[[ -r "$CFG" ]] && command -v jq >/dev/null 2>&1 && \
+  DUMP=$(jq -r 'if has("dumpPath") and .dumpPath != null then .dumpPath else empty end' "$CFG" 2>/dev/null)
+[[ -n "${CLAUDE_DONT_STOP_DUMP:-}" ]] && DUMP="$CLAUDE_DONT_STOP_DUMP"
+[[ -n "$DUMP" ]] || exit 0
+
+mkdir -p "$(dirname "$DUMP")" 2>/dev/null
+# Whole payload, plus a timestamp. Never filter on message text: quoting an error
+# string in a prompt or a command produces false positives, so downstream reads
+# must key on structured fields (.error, .hook_event_name), never on prose.
+printf '%s' "$IN" | jq -c --arg ts "$(date -Is)" '{ts:$ts} + .' >> "$DUMP" 2>/dev/null
+exit 0

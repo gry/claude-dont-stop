@@ -52,10 +52,20 @@ case "${1:-status}" in
                 || { echo "usage: dont-stop-ctl threshold <1-100>" >&2; exit 2; }
               set_key threshold "$2"; echo "5h window threshold: $2%" ;;
   [0-9]*)     exec "$0" threshold "$1" ;;
+  dump)       case "${2:-}" in
+                on)  set_key dumpPath "\"$DS_DIR/payloads.jsonl\""
+                     echo "payload dump ON -> $DS_DIR/payloads.jsonl"
+                     echo "every hook payload is recorded verbatim; 'dump off' when done" ;;
+                off) tmp=$(mktemp); jq 'del(.dumpPath)' "$CFG" > "$tmp" && mv "$tmp" "$CFG"
+                     echo "payload dump OFF" ;;
+                *)   D=$(get dumpPath ""); [[ -n "$D" ]] && echo "dump ON -> $D" || echo "dump OFF"
+                     [[ -s "${D:-/nonexistent}" ]] && { echo "--- last StopFailure payloads ---"
+                       jq -c 'select(.hook_event_name == "StopFailure") | {ts, error, stop_hook_active}' "$D" | tail -10; } ;;
+              esac ;;
   log)        [[ -s "$LOG" ]] && tail -n "${2:-40}" "$LOG" || echo "(no waits recorded)" ;;
   config)     jq . "$CFG" ;;
   *) cat >&2 <<EOF
-usage: dont-stop-ctl [status|on|off|threshold <N>|<N>|log [n]|config]
+usage: dont-stop-ctl [status|on|off|threshold <N>|<N>|dump [on|off]|log [n]|config]
 EOF
      exit 2 ;;
 esac

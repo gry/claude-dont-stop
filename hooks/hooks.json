@@ -5,6 +5,11 @@
         "hooks": [
           {
             "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/dont-stop-dump",
+            "timeout": 5
+          },
+          {
+            "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/dont-stop-context",
             "timeout": 25
           }
@@ -16,6 +21,11 @@
         "hooks": [
           {
             "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/dont-stop-dump",
+            "timeout": 5
+          },
+          {
+            "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/dont-stop-context",
             "timeout": 10
           }
@@ -25,6 +35,11 @@
     "Stop": [
       {
         "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/dont-stop-dump",
+            "timeout": 5
+          },
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/dont-stop-announce",
@@ -46,6 +61,11 @@
         "hooks": [
           {
             "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/dont-stop-dump",
+            "timeout": 5
+          },
+          {
+            "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/dont-stop-announce",
             "timeout": 15
           },
@@ -63,6 +83,11 @@
     "SubagentStop": [
       {
         "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/dont-stop-dump",
+            "timeout": 5
+          },
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/dont-stop-announce",
