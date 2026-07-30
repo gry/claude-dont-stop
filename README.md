@@ -85,38 +85,64 @@ you already had.
 
 ## Updating
 
+**Which route you installed by decides how you update.** Check with
+`claude plugin marketplace list`.
+
+### Installed from GitHub (`bootstrap.sh`, or `marketplace add gry/claude-dont-stop`)
+
 ```bash
 claude plugin update dont-stop@claude-dont-stop   # then restart Claude Code
 ```
 
-That single command is enough: it checks the source directly and pulls the newest
-published version, even when the locally cached marketplace copy is behind. You do
-**not** need `claude plugin marketplace update` first.
+Updates are keyed on the `version` field in `.claude-plugin/plugin.json`, so only
+a version bump produces a new install; commits that do not bump it are not picked
+up. Old versions stay in `~/.claude/plugins/cache/` alongside the new one.
 
-Updates are keyed on the `version` field in `.claude-plugin/plugin.json`, so only a
-version bump produces a new install; commits that do not bump it are not picked up.
-Old versions stay in `~/.claude/plugins/cache/` alongside the new one.
+### Installed from a clone (`install.sh`)
 
-Marketplace entries accept an `autoUpdate` flag in `settings.json`:
+`install.sh` registers a **directory** marketplace, and a directory source is
+never fetched from the network. `claude plugin update` reads the `plugin.json`
+in your clone, so it will happily report *"already at the latest version"* while
+a newer release sits on GitHub. The `/plugin` UI says so outright: *"Local
+plugins cannot be updated remotely. To update, modify the source at: ./"*.
 
-```jsonc
-"extraKnownMarketplaces": {
-  "claude-dont-stop": {
-    "source": { "source": "github", "repo": "gry/claude-dont-stop" },
-    "autoUpdate": true
-  }
-}
+So pull first:
+
+```bash
+cd /path/to/your/claude-dont-stop && git pull
+claude plugin update dont-stop@claude-dont-stop
 ```
 
-It is a real setting and is synced into `known_marketplaces.json` at session start.
-However, in testing on 2.1.220 it was never observed refreshing an installed plugin
-on its own — not even with a deliberately stale `lastUpdated`. Treat `claude plugin
-update` as the reliable path and `autoUpdate` as a best-effort extra.
+If the clone is gone (e.g. it lived under `/tmp`), switch to the GitHub route
+instead — see below.
 
-`claude plugin update` works for a directory-source install too — it reinstalls
-from the registered marketplace path, so a `git pull` plus a version bump in your
-clone is enough. Re-running `./install.sh` does the same and additionally refreshes
-the settings wiring, which is what you want if the statusLine setup changed.
+### Switching a clone install over to GitHub
+
+Worth doing on any machine you do not develop on: it removes the dependency on a
+checkout that can go stale or vanish.
+
+```bash
+claude plugin uninstall dont-stop@claude-dont-stop
+claude plugin marketplace remove claude-dont-stop
+claude plugin marketplace add gry/claude-dont-stop
+claude plugin install dont-stop@claude-dont-stop
+```
+
+Order matters: removing the marketplace orphans the installed plugin, so the
+reinstall at the end is required, not optional.
+
+### When the marketplace cache is stale
+
+Measured on 2.1.220: `claude plugin marketplace update` can print
+**"Successfully updated marketplace"** without actually refetching — the cached
+clone is shallow and a recency check can skip the fetch. If the version on disk
+still looks old afterwards, remove and re-add the marketplace (the four commands
+above); that does force a fresh clone.
+
+`autoUpdate` in `settings.json` is a real marketplace field and is synced into
+`known_marketplaces.json` at session start, but it was never observed refreshing
+an installed plugin on its own, even with a deliberately stale `lastUpdated`.
+Treat explicit updates as the reliable path.
 
 ### In a devcontainer
 
