@@ -51,8 +51,12 @@ NEW=$(jq \
   # it has to be installed once)
   .extraKnownMarketplaces["claude-dont-stop"] = { source: { source: "directory", path: $root } }
 
-  # statusLine: wrap whatever was there, without clobbering it or double-wrapping
-  | if (.statusLine.command // "") == $sl then .
+  # statusLine: wrap whatever was there, without clobbering it or double-wrapping.
+  # The match is on the name, not on $sl: the statusLine already in place may be
+  # the bootstrap shim or another checkout of this repo, and recording one of
+  # those as the delegate makes the script eval a path back into itself — every
+  # render then forks a chain that never ends. Anything of ours is left alone.
+  | if (.statusLine.command // "") | contains("dont-stop-statusline") then .
     else
       ( if (.statusLine.command // "") == "" then .
         else .["_dontStopPrevStatusLine"] = .statusLine.command end )
@@ -78,6 +82,14 @@ printf '%s\n' "$NEW" > "$SETTINGS"
 if [[ -n "$PREV" ]]; then
   tmp=$(mktemp); jq --arg d "$PREV" '.statuslineDelegate = $d' "$CFG" > "$tmp" && mv "$tmp" "$CFG"
   echo "previous statusLine preserved as statuslineDelegate: $PREV"
+fi
+
+# Repair a config an earlier version of this script (or of bootstrap.sh) poisoned
+# with a delegate pointing back at one of our own statuslines.
+OLD_DELEGATE=$(jq -r '.statuslineDelegate // empty' "$CFG" 2>/dev/null || true)
+if [[ "$OLD_DELEGATE" == *dont-stop-statusline* ]]; then
+  tmp=$(mktemp); jq 'del(.statuslineDelegate)' "$CFG" > "$tmp" && mv "$tmp" "$CFG"
+  echo "removed a self-referential statuslineDelegate: $OLD_DELEGATE"
 fi
 
 # --- 4. install the plugin -----------------------------------------------------

@@ -91,10 +91,24 @@ echo "statusline shim: $SHIM"
 EOF
 
 PREV=$(jq -r '.statusLine.command // empty' "$SETTINGS")
-if [[ -n "$PREV" && "$PREV" != "$SHIM" ]]; then
+
+# Never record one of our own statuslines as the delegate: the script would eval
+# a path back into itself, and every render would fork a chain that never ends.
+# "$PREV" != "$SHIM" is not enough on its own — an older install may have wired
+# settings.json straight at a checkout's bin/dont-stop-statusline, which is
+# neither the shim nor recognisable as ours without matching on the name.
+if [[ -n "$PREV" && "$PREV" != *dont-stop-statusline* ]]; then
   tmp=$(mktemp); jq --arg d "$PREV" '.statuslineDelegate = $d' "$CFG" > "$tmp" && mv "$tmp" "$CFG"
   echo "previous statusLine preserved as statuslineDelegate: $PREV"
 fi
+
+# Repair a config an earlier version of this script poisoned that way.
+OLD_DELEGATE=$(jq -r '.statuslineDelegate // empty' "$CFG" 2>/dev/null || true)
+if [[ "$OLD_DELEGATE" == *dont-stop-statusline* ]]; then
+  tmp=$(mktemp); jq 'del(.statuslineDelegate)' "$CFG" > "$tmp" && mv "$tmp" "$CFG"
+  echo "removed a self-referential statuslineDelegate: $OLD_DELEGATE"
+fi
+
 if [[ "$PREV" != "$SHIM" ]]; then
   backup
   tmp=$(mktemp)

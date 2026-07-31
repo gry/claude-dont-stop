@@ -320,5 +320,31 @@ OUT=$(printf '{"model":{"display_name":"Opus 5"}}' | "$BIN/dont-stop-statusline"
 check "no rate_limits in the input -> still delegates without breaking" "$RC" 0
 
 echo
+echo "== dont-stop-statusline: delegate loops =="
+# A delegate pointing back at a dont-stop statusline used to fork a chain that
+# never ended: every render spawned another, thousands deep, until the machine
+# crawled. Run each case in a subshell with a process budget just above what a
+# healthy render needs, so a regression dies here instead of taking the box down.
+# ulimit -u caps tasks, threads included, so the budget is measured in threads
+# (ps -L) — counting processes lands an order of magnitude low on a desktop and
+# every fork fails, healthy run included.
+capped() { ( ulimit -u "$(( $(ps -u "$(id -u)" -L --no-headers 2>/dev/null | wc -l) + 200 ))" 2>/dev/null
+             printf '%s' "$IN" | timeout 10 "$BIN/dont-stop-statusline" ); }
+
+cfg '{enabled:true, statuslineDelegate:"'"$BIN/dont-stop-statusline"'"}'
+OUT=$(capped); RC=$?
+check "a delegate pointing back at us does not recurse" "$RC" 0
+has  "  and falls back to our own line" "$OUT" "5h 42%"
+
+# The name check cannot see through a wrapper, so the depth guard has to hold on
+# its own: this is what the second lap of an indirect loop looks like.
+cfg '{enabled:true, statuslineDelegate:"echo DELEGATE-OK"}'
+export DONT_STOP_SL_DEPTH=1
+OUT=$(capped); RC=$?
+unset DONT_STOP_SL_DEPTH
+check "already inside a delegated render -> does not delegate again" "$RC" 0
+has  "  and prints our own line instead" "$OUT" "5h 42%"
+
+echo
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 exit $(( FAIL > 0 ))

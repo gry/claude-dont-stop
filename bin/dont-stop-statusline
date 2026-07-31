@@ -37,11 +37,23 @@ if command -v jq >/dev/null 2>&1; then
 fi
 
 # --- 2. delegate to the previous statusline ------------------------------------
+# A delegate that leads back here turns the eval below into a fork bomb: every
+# render spawns a chain that never terminates. Two guards, because neither
+# catches the other's case:
+#   - the name check stops the direct self-reference (a stale path from an older
+#     install, the bootstrap shim, or this very file) before we ever fork;
+#   - DONT_STOP_SL_DEPTH stops an indirect loop that comes back through us via a
+#     wrapper we cannot inspect, on the second lap.
+# Either way we fall through to our own line rather than going quiet.
 DELEGATE=""
 [[ -r "$CFG" ]] && command -v jq >/dev/null 2>&1 && \
   DELEGATE=$(jq -r '.statuslineDelegate // empty' "$CFG" 2>/dev/null)
 
+[[ "$DELEGATE" == *dont-stop-statusline* ]] && DELEGATE=""
+[[ -n "${DONT_STOP_SL_DEPTH:-}" ]] && DELEGATE=""
+
 if [[ -n "$DELEGATE" ]]; then
+  export DONT_STOP_SL_DEPTH=1
   printf '%s' "$IN" | eval "$DELEGATE"
   exit $?
 fi
