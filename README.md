@@ -10,9 +10,10 @@ codebase-wide sweeps — where the work used to die halfway through with a 429.
 
 ## What it actually does
 
-Three hooks, all with `asyncRewake: true` — they run in the **background**, never
-block the UI, and when they exit with code 2 Claude Code wakes the model and hands
-it their stderr as instructions.
+The waiting is done by `dont-stop-gate`, registered on three events with
+`asyncRewake: true` — it runs in the **background**, never blocks the UI, and when
+it exits with code 2 Claude Code wakes the model and hands it its stderr as
+instructions.
 
 | Hook | When | What it does |
 |---|---|---|
@@ -20,6 +21,15 @@ it their stderr as instructions.
 | `StopFailure` | the turn died with `error: "rate_limit"` | safety net: waits and resumes even if the gate did not see it coming |
 | `SubagentStop` | a subagent finishes | same, so subagents **keep their context** instead of dying |
 | `SessionStart`, `UserPromptSubmit` | — | inject usage state into the model's context via `hookSpecificOutput.additionalContext` |
+
+**You are told when the pause starts, not only when it ends.** An async hook's
+output only surfaces once it finishes, which for the gate is *after* the wait —
+so a second hook, `dont-stop-announce`, runs on the same events without
+`asyncRewake`, reads the cache and prints the pause and its wake-up time
+immediately (`⏸ dont-stop: 5h window at 100%. Pausing until 17:40 CEST (~54m)…`).
+It announces the wait the gate is *actually* going to make, including the case
+where the API returns a rate limit while the percentages still look fine, and
+stays quiet whenever the gate would decline to wait.
 
 **It sleeps until an absolute instant (`resets_at`), never for "N seconds".** That
 is what makes several concurrent sleepers (main thread plus subagents) all wake at

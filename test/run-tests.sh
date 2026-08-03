@@ -289,6 +289,38 @@ cfg '{enabled:true, threshold:95, maxSleepSecs:60}'
 OUT=$(printf '{"hook_event_name":"Stop","stop_hook_active":false}' | "$BIN/dont-stop-announce")
 check "silent when the wait exceeds maxSleepSecs (gate would refuse)" "$OUT" ""
 
+# The regression this file exists for: a rate_limit StopFailure puts the gate in
+# its FORCED path and it waits even though the percentage is nowhere near the
+# threshold. The announcement has to follow, or the session goes quiet for an
+# hour with the statusline reading 44%.
+cfg '{enabled:true, threshold:95, graceSecs:60, maxSleepSecs:21600}'
+seed 44 5400 86 400000
+RL='{"hook_event_name":"StopFailure","error":"rate_limit","stop_hook_active":false}'
+M=$(printf '%s' "$RL" | "$BIN/dont-stop-announce" | jq -r '.systemMessage // empty')
+has "rate_limit below the threshold still announces the pause" "$M" "Pausing until"
+has "  and says the API is what forced it" "$M" "returned a rate limit"
+has "  quoting what the window claims" "$M" "44%"
+
+# Same forced wait, but the gate will refuse it: do not promise anything.
+cfg '{enabled:true, threshold:95, maxSleepSecs:60}'
+OUT=$(printf '%s' "$RL" | "$BIN/dont-stop-announce")
+check "  silent when that forced wait exceeds maxSleepSecs" "$OUT" ""
+seed 44 -10 86 400000
+cfg '{enabled:true, threshold:95, graceSecs:1, maxSleepSecs:21600}'
+OUT=$(printf '%s' "$RL" | "$BIN/dont-stop-announce")
+check "  silent when the reset has already passed" "$OUT" ""
+
+# No cache at all and no network: still say something on a 429, because the gate
+# will retry blind rather than give up.
+rm -f "$DS/rate_limits.json" "$DS/usage.json"
+M=$(printf '%s' "$RL" | \
+    CLAUDE_USAGE_CURL_TIMEOUT=1 HOME="$TMP" "$BIN/dont-stop-announce" | jq -r '.systemMessage // empty')
+has "no usage data at all -> still reports the rate limit" "$M" "rate limit"
+has "  without inventing a wake-up time" "$M" "resume by myself"
+OUT=$(printf '{"hook_event_name":"Stop","stop_hook_active":false}' | \
+      CLAUDE_USAGE_CURL_TIMEOUT=1 HOME="$TMP" "$BIN/dont-stop-announce")
+check "  and stays silent on a plain Stop with no data" "$OUT" ""
+
 echo
 echo "== dont-stop-context: output shape =="
 seed 37 5400 39 400000

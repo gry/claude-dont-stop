@@ -49,6 +49,9 @@ MODE=""
 GATE_LIMIT="${CLAUDE_DONT_STOP_THRESHOLD:-95}"
 WEEKLY_LIMIT="${CLAUDE_DONT_STOP_WEEKLY_LIMIT:-99}"
 WEEKLY_MAX_WAIT="${CLAUDE_DONT_STOP_WEEKLY_MAX_WAIT:-28800}"   # 8h
+# Callers on a hook timeout (dont-stop-announce runs synchronously, before the
+# turn can end) need the request bounded well below that timeout.
+CURL_TIMEOUT="${CLAUDE_USAGE_CURL_TIMEOUT:-20}"
 
 die() { printf 'claude-usage: %s\n' "$1" >&2; exit 2; }
 
@@ -105,7 +108,7 @@ fetch_endpoint() {
       "$(date -d "@$((exp / 1000))" 2>/dev/null)" >&2
   fi
 
-  resp=$(curl -sS --max-time 20 -w '\n%{http_code}' "$ENDPOINT" \
+  resp=$(curl -sS --max-time "$CURL_TIMEOUT" -w '\n%{http_code}' "$ENDPOINT" \
     -H "Authorization: Bearer $token" \
     -H "anthropic-beta: oauth-2025-04-20") || return 1
   code=${resp##*$'\n'}

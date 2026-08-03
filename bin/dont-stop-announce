@@ -8,8 +8,13 @@
 # pause as it begins. This hook is registered on the same events but WITHOUT
 # asyncRewake, so it runs first, prints, and exits immediately.
 #
-# It only ever prints; it never blocks and never waits. Cheap by design: reads
-# the cache, never the network.
+# It only ever prints; it never blocks and never waits. Cheap by design: it reads
+# the cache, and only falls back to the endpoint (with a short timeout, since it
+# runs synchronously) when there is no cache at all — being silent there would
+# hide a pause the gate is going to make regardless.
+#
+# Its one rule: announce the wait the gate is ACTUALLY going to make. Every
+# branch below mirrors a branch of dont-stop-gate, silence included.
 
 set -uo pipefail
 
@@ -35,8 +40,15 @@ case "${CLAUDE_DONT_STOP:-}" in 0|false|off|no) ENABLED=false ;; 1|true|on|yes) 
 
 # Same guards as the gate, so we never announce a pause that will not happen.
 [[ "$(jq_in '.stop_hook_active')" == "true" ]] && exit 0
+
+# A rate_limit StopFailure puts the gate in its FORCED path: the API already
+# returned a 429, so the gate waits whatever the percentages say. We have to
+# mirror that here or the pause goes unannounced exactly when it is least
+# expected — the window reads 44% and the session goes quiet for an hour.
+FORCED=0
 if [[ "$EVENT" == "StopFailure" ]]; then
   [[ "$(jq_in '.error // empty')" == "rate_limit" ]] || exit 0
+  FORCED=1
 fi
 
 THRESHOLD=$(cfg threshold 95)
@@ -46,27 +58,59 @@ MAX_SLEEP=$(cfg maxSleepSecs 21600)
 export CLAUDE_DONT_STOP_WEEKLY_MAX_WAIT="$(cfg weeklyMaxWaitSecs 28800)"
 OUT=$("$USAGE_BIN" --gate "$THRESHOLD" --cache-only 2>/dev/null); RC=$?
 
+# No statusline cache and no endpoint copy (a fresh container, a session without
+# the statusLine wrapper): staying quiet would hide a pause the gate is going to
+# make anyway, because the gate IS allowed to use the network. Pay for one
+# bounded request instead. The response is cached, so the gate — running right
+# after us — reuses it rather than fetching twice.
+if (( RC == 2 )); then
+  OUT=$(CLAUDE_USAGE_CURL_TIMEOUT="${CLAUDE_USAGE_CURL_TIMEOUT:-8}" \
+        "$USAGE_BIN" --gate "$THRESHOLD" 2>/dev/null); RC=$?
+fi
+
 fmt() { local w=$1
   if   (( w < 60 ));   then printf '%ss' "$w"
   elif (( w < 3600 )); then printf '%dm' $(( w/60 ))
   else printf '%dh%02dm' $(( w/3600 )) $(( w%3600/60 )); fi; }
 
+# Use the same grace the gate will use, so the announced time matches the actual
+# wake-up rather than being a minute out.
+GRACE=$(cfg graceSecs 60)
+
+# announce_wait <deadline_epoch> <why> — says nothing if the gate would not wait.
+# Returns 2 when there is no deadline to work from and 1 when there is one but
+# the gate would decline it; the caller must not confuse the two.
+announce_wait() {
+  local dl=$1 why=$2 target wait
+  [[ "$dl" =~ ^[0-9]+$ ]] || return 2
+  target=$(( dl + GRACE ))
+  wait=$(( target - $(date +%s) ))
+  (( wait <= 0 ))         && return 1     # nothing to wait for; the gate will no-op
+  (( wait > MAX_SLEEP ))  && return 1     # the gate will refuse; do not promise a wait
+  say "⏸  dont-stop: $why. Pausing until $(date -d "@$target" '+%H:%M %Z') (~$(fmt "$wait")) and resuming on its own — you can leave this running and walk away. Nothing else to do."
+}
+
 case "$RC" in
   1|4)
-    DL=$(sed -n 's/.*deadline=\([0-9]*\).*/\1/p' <<<"$OUT")
-    [[ "$DL" =~ ^[0-9]+$ ]] || exit 0
-    # Use the same grace the gate will use, so the announced time matches the
-    # actual wake-up rather than being a minute out.
-    GRACE=$(cfg graceSecs 60)
-    TARGET=$(( DL + GRACE ))
-    WAIT=$(( TARGET - $(date +%s) ))
-    (( WAIT <= 0 )) && exit 0               # nothing to wait for; the gate will no-op
-    (( WAIT > MAX_SLEEP )) && exit 0        # the gate will refuse; do not promise a wait
     WHY=$([[ "$RC" == 4 ]] && echo "weekly cap exhausted" || echo "5h window at $(sed -n 's/.*5h=\([0-9]*\)%.*/\1/p' <<<"$OUT")%")
-    say "⏸  dont-stop: $WHY. Pausing until $(date -d "@$TARGET" '+%H:%M %Z') (~$(fmt "$WAIT")) and resuming on its own — you can leave this running and walk away. Nothing else to do."
+    # If the gate would decline this wait (deadline past, or longer than
+    # maxSleepSecs) there is nothing to announce, not even on a forced run.
+    announce_wait "$(sed -n 's/.*deadline=\([0-9]*\).*/\1/p' <<<"$OUT")" "$WHY" || exit 0
     ;;
   3)
     say "⛔ dont-stop: WEEKLY cap exhausted and its reset is too far off to wait for. Stopping here rather than sleeping for days. ($OUT)"
     ;;
 esac
-exit 0
+
+# Below the threshold, or no usable data at all. Normally there is nothing to
+# say — unless the API itself returned a rate limit, in which case the gate is
+# about to wait for the 5h reset regardless of what the numbers claim.
+(( FORCED )) || exit 0
+PCT=$(sed -n 's/.*5h=\([0-9]*\)%.*/\1/p' <<<"$OUT")
+announce_wait "$("$USAGE_BIN" --norm --cache-only 2>/dev/null | jq -r '.five_reset // empty')" \
+              "the API returned a rate limit${PCT:+ (the 5h window only reads ${PCT}%)}"
+(( $? == 1 )) && exit 0    # a reset time we know about, but one the gate will not wait for
+
+# A 429 and no reset time to read: the gate falls back to a blind retry. Say so
+# without promising an hour we cannot compute.
+say "⏸  dont-stop: the API returned a rate limit and there is no usage data to read a reset time from. Waiting and retrying on my own — you can leave this running; I will resume by myself."
